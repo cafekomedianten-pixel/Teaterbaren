@@ -1,0 +1,87 @@
+
+import os,sqlite3,secrets,hmac,csv,io
+from flask import Flask,request,redirect,session,render_template_string,abort,Response
+app=Flask(__name__)
+app.secret_key=os.environ.get('SECRET_KEY',secrets.token_hex(32))
+DB=os.environ.get('DB_PATH','orders.db')
+MENU=[('Bubbligt',264,'Före'),('Ost & Chark',359,'Före'),('Bubbligt Deluxe',444,'Före och paus'),('Pausbubbel',180,'Paus'),('Öl & korv',154,'Paus'),('Ost i kuber',59,'Snacks'),('Ölkorv',59,'Snacks'),('Marconamandlar',55,'Snacks'),('Oliver',50,'Snacks'),('Cerro Cava Brut',125,'Dryck'),('Husets vin',110,'Dryck'),('Arboga 50 cl',95,'Dryck'),('Carlsberg Hof 33 cl',75,'Dryck'),('Brooklyn Special Effects 33 cl',48,'Dryck'),('Lemonad',48,'Dryck')]
+def db():
+ c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
+with db() as c:
+ c.execute('CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,title TEXT,starts TEXT,active INTEGER DEFAULT 1)')
+ c.execute('CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY,event_id INTEGER,name TEXT,email TEXT,phone TEXT,notes TEXT,items TEXT,total INTEGER,paid INTEGER DEFAULT 0,table_no TEXT DEFAULT "",status TEXT DEFAULT "Ny")')
+BASE='''<!doctype html><html lang="sv"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Varbergs Teaterbar</title><style>body{margin:0;background:#faf9f6;color:#171717;font:16px system-ui}header{background:#111;color:white;padding:25px;text-align:center;border-bottom:5px solid #f39200}header h1{font: bold 38px Georgia;margin:0}header small,h2{color:#e88900}main{max-width:800px;margin:auto;padding:20px}.card{background:white;border:1px solid #ddd;border-radius:10px;padding:16px;margin:12px 0}input,select,textarea{font:inherit;padding:9px;border:1px solid #aaa;border-radius:5px;max-width:100%;box-sizing:border-box}label{display:block;margin:12px 0}button{padding:12px 18px;background:#f39200;border:0;border-radius:6px;font-weight:bold;cursor:pointer}.item{display:flex;justify-content:space-between;align-items:center;gap:10px}.item input{width:65px}a{color:#985600}hr{border:0;border-top:1px solid #ddd}</style><header><h1>VARBERGS TEATERBAR</h1><small>EN DEL AV CAFÉ KOMEDIANTEN</small></header><main>{{body|safe}}</main></html>'''
+def page(template,**kw):return render_template_string(BASE,body=render_template_string(template,**kw))
+def token():
+ if 'csrf' not in session:session['csrf']=secrets.token_urlsafe(24)
+ return session['csrf']
+app.jinja_env.globals['token']=token
+def verify():
+ if not hmac.compare_digest(request.form.get('csrf',''),token()):abort(400)
+def admin_only():
+ if not session.get('admin'):abort(403)
+@app.get('/')
+def index():
+ with db() as c:events=c.execute('SELECT * FROM events WHERE active=1 ORDER BY starts').fetchall()
+ return page('''<h2>Förbeställ mat och dryck</h2><p>Betala på plats före föreställningen.</p>{% if events %}<form action="/shop"><label>Välj föreställning <select name="event">{% for e in events %}<option value="{{e.id}}">{{e.title}} – {{e.starts}}</option>{% endfor %}</select></label><button>Fortsätt</button></form>{% else %}<p>Inga föreställningar upplagda ännu.</p>{% endif %}''',events=events)
+@app.get('/shop')
+def shop():
+ with db() as c:e=c.execute('SELECT * FROM events WHERE id=? AND active=1',(request.args.get('event'),)).fetchone()
+ if not e:abort(404)
+ return page('''<h2>{{e.title}} – {{e.starts}}</h2><form method="post" action="/order"><input type="hidden" name="csrf" value="{{token()}}"><input type="hidden" name="event" value="{{e.id}}">{% for phase in phases %}<h2>{{phase}}</h2>{% for i,p in products %}{% if p[2]==phase %}<div class="card"><div class="item"><div><strong>{{p[0]}}</strong><p>{{p[1]}} kr</p></div><label>Antal <input type="number" min="0" max="30" value="0" name="q{{i}}"></label></div>{% if i<5 %}<label>Dryckesval <select name="d{{i}}"><option>Ordinarie</option><option>Alkoholfritt</option><option>Vin</option><option>Öl</option></select></label>{% endif %}</div>{% endif %}{% endfor %}{% endfor %}<div class="card"><h2>Kontaktuppgifter</h2><label>Namn <input name="name" required maxlength="120"></label><label>E-post <input type="email" name="email" required maxlength="200"></label><label>Telefon <input name="phone" required maxlength="40"></label><label>Allergier och önskemål <textarea name="notes" maxlength="1000"></textarea></label><button>Bekräfta beställningen</button></div></form>''',e=e,products=list(enumerate(MENU)),phases=list(dict.fromkeys(p[2] for p in MENU)))
+@app.post('/order')
+def order():
+ verify()
+ import json
+ with db() as c:
+  e=c.execute('SELECT * FROM events WHERE id=? AND active=1',(request.form.get('event'),)).fetchone()
+  if not e:abort(400)
+  items=[]
+  for i,p in enumerate(MENU):
+   try:q=int(request.form.get('q'+str(i),'0'))
+   except ValueError:abort(400)
+   if not 0<=q<=30:abort(400)
+   if q:items.append({'product':p[0],'price':p[1],'phase':p[2],'qty':q,'drink':request.form.get('d'+str(i),'Ordinarie')[:40]})
+  if not items:abort(400,'Välj minst en produkt')
+  name=request.form.get('name','').strip()[:120];email=request.form.get('email','').strip()[:200];phone=request.form.get('phone','').strip()[:40]
+  if not name or '@' not in email or not phone:abort(400)
+  total=sum(i['price']*i['qty'] for i in items)
+  oid=c.execute('INSERT INTO orders(event_id,name,email,phone,notes,items,total) VALUES(?,?,?,?,?,?,?)',(e['id'],name,email,phone,request.form.get('notes','')[:1000],json.dumps(items,ensure_ascii=False),total)).lastrowid
+ return page('''<div class="card"><h2>Tack för din beställning!</h2><h1>TB-{{'%05d'|format(oid)}}</h1><p>{{e.title}} – {{e.starts}}</p><p>Totalt: <strong>{{total}} kr</strong>. Betalas på plats.</p><p>Spara ordernumret. E-postbekräftelse är ännu inte aktiverad.</p></div>''',oid=oid,e=e,total=total)
+@app.route('/admin/login',methods=['GET','POST'])
+def login():
+ if request.method=='POST':
+  verify()
+  pwd=os.environ.get('ADMIN_PASSWORD','')
+  if pwd and hmac.compare_digest(pwd,request.form.get('password','')):session.clear();session['admin']=True;return redirect('/admin')
+ return page('''<h2>Personalinloggning</h2><form method="post"><input type="hidden" name="csrf" value="{{token()}}"><label>Lösenord <input type="password" name="password"></label><button>Logga in</button></form>''')
+@app.get('/admin')
+def admin():
+ admin_only()
+ with db() as c:events=c.execute('SELECT * FROM events ORDER BY starts DESC').fetchall();orders=c.execute('SELECT o.*,e.title FROM orders o JOIN events e ON o.event_id=e.id ORDER BY o.id DESC').fetchall()
+ import json
+ orders=[dict(o,parsed=json.loads(o['items'])) for o in orders]
+ return page('''<h2>Personaladministration</h2><div class="card"><h3>Ny föreställning</h3><form method="post" action="/admin/event"><input type="hidden" name="csrf" value="{{token()}}"><label>Namn <input name="title" required></label><label>Datum/tid <input type="datetime-local" name="starts" required></label><button>Lägg till</button></form></div><h2>Föreställningar</h2>{% for e in events %}<div class="card">{{e.title}} – {{e.starts}} ({{'Öppen' if e.active else 'Stängd'}})<form action="/admin/toggle/{{e.id}}" method="post"><input type="hidden" name="csrf" value="{{token()}}"><button>Öppna/stäng</button></form></div>{% endfor %}<p><a href="/admin/export">Exportera beställningar (CSV)</a></p><h2>Beställningar</h2>{% for o in orders %}<div class="card"><strong>TB-{{'%05d'|format(o.id)}} · {{o.name}}</strong><p>{{o.title}} · {{o.phone}} · {{o.email}}</p><p>{{o.notes}}</p>{% for i in o.parsed %}<p>{{i.qty}} × {{i.product}} – {{i.phase}} ({{i.drink}})</p>{% endfor %}<p><strong>{{o.total}} kr</strong></p><form method="post" action="/admin/update/{{o.id}}"><input type="hidden" name="csrf" value="{{token()}}"><label>Bord <input name="table_no" value="{{o.table_no}}"></label><label>Status <select name="status">{% for s in ['Ny','Förbereds','Klar','Utlämnad','Avbokad'] %}<option {% if s==o.status %}selected{% endif %}>{{s}}</option>{% endfor %}</select></label><label><input type="checkbox" name="paid" {% if o.paid %}checked{% endif %}> Betald</label><button>Spara</button></form></div>{% endfor %}''',events=events,orders=orders)
+@app.post('/admin/event')
+def event():
+ admin_only();verify()
+ with db() as c:c.execute('INSERT INTO events(title,starts) VALUES(?,?)',(request.form['title'][:200],request.form['starts']))
+ return redirect('/admin')
+@app.post('/admin/toggle/<int:id>')
+def toggle(id):
+ admin_only();verify()
+ with db() as c:c.execute('UPDATE events SET active=1-active WHERE id=?',(id,))
+ return redirect('/admin')
+@app.post('/admin/update/<int:id>')
+def update(id):
+ admin_only();verify()
+ if request.form.get('status') not in ['Ny','Förbereds','Klar','Utlämnad','Avbokad']:abort(400)
+ with db() as c:c.execute('UPDATE orders SET status=?,paid=?,table_no=? WHERE id=?',(request.form['status'],int('paid' in request.form),request.form.get('table_no','')[:30],id))
+ return redirect('/admin')
+@app.get('/admin/export')
+def export():
+ admin_only()
+ with db() as c:rows=c.execute('SELECT * FROM orders ORDER BY id').fetchall()
+ f=io.StringIO();w=csv.writer(f);w.writerow(['Order','Föreställnings-ID','Namn','E-post','Telefon','Notering','Produkter JSON','Summa','Betald','Bord','Status']);w.writerows([tuple(r) for r in rows])
+ return Response('\ufeff'+f.getvalue(),mimetype='text/csv',headers={'Content-Disposition':'attachment; filename=orders.csv'})
+if __name__=='__main__':app.run(port=8000)
